@@ -15,7 +15,7 @@ const PORT = Number(process.env.PORT) || 10000;
 const ADMIN = '@DENIUS09';
 
 const SOURCE_API =
-  'https://kwinstore.com/sunwin/tx/history/b54b32ca9f748d5dbe64f421f14f1f04fa8d30012b17d0f5';
+  'https://kwinstore.com/sunwin/tx/history/c806cf04a7fdf1cace25db6c7a8bdd8e048242145ee726dc';
 
 // ==================== AI CONFIG (HARD-CODED) ====================
 
