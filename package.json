@@ -1,7 +1,7 @@
 {
   "name": "denius-api-sunvip",
-  "version": "3.0.0",
-  "description": "DENIUS Sunwin Tài/Xỉu API - Gemini AI Powered",
+  "version": "4.0.0",
+  "description": "DENIUS Sunwin Tài/Xỉu API - Gemini Interactions API",
   "main": "ttoanvip.js",
   "scripts": {
     "start": "node ttoanvip.js"
