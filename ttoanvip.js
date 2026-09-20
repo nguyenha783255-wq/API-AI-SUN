@@ -1,47 +1,69 @@
 /* =====================================================================
- *  DENIUS SUNVIP API - AI POWERED EDITION
- *  Bỏ toàn bộ thuật toán cứng. AI (Gemini) tự phân tích lịch sử.
+ *  DENIUS SUNVIP API - AI POWERED EDITION (Gemini 3 Flash Preview)
+ *  - Xác thực: x-goog-api-key (Gemini API Key)
+ *  - Model: gemini-3-flash-preview (mặc định)
+ *  - Thinking: high (nếu model hỗ trợ)
+ *  - Structured Output: JSON Schema
+ *  - Cache theo session, retry có giới hạn, self-audit
  * ===================================================================== */
 
 const express = require('express');
 
 const app = express();
 app.disable('x-powered-by');
+
+// ==================== CORS ====================
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type, x-goog-api-key');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json({ limit: '100kb' }));
 
 // ==================== CONFIG ====================
-
 const PORT = Number(process.env.PORT) || 10000;
 const ADMIN = '@DENIUS09';
 
 const SOURCE_API =
+  process.env.SOURCE_API ||
   'https://kwinstore.com/sunwin/tx/history/c806cf04a7fdf1cace25db6c7a8bdd8e048242145ee726dc';
 
-// ==================== AI CONFIG (HARD-CODED) ====================
-
-const GEMINI_API_KEY = 'AQ.Ab8RN6IIfgldALftXYWkGqt0pTTmgr8LVxT8AqFpng44FFARGw';
-const GEMINI_MODEL = 'gemini-2.0-flash';
-
-// Endpoint chuẩn Google Generative Language API
+// ==================== GEMINI AI CONFIG ====================
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3-flash-preview';
 const GEMINI_URL =
   `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
-// Timeout / Cache
-const CACHE_MS = 750;
+// Timeout / Cache / Limits
+const SOURCE_CACHE_MS = 750;
 const FETCH_TIMEOUT_MS = 6000;
-const AI_TIMEOUT_MS = 30000;
-const AI_RETRY = 2;
+const AI_TIMEOUT_MS = 45000;
+const AI_MAX_RETRIES = 2;
+const AI_RETRY_DELAY_MS = 1000;
 const MAX_SOURCE_RECORDS = 1000;
-const AI_HISTORY_WINDOW = 60;         // số phiên gửi cho AI
-const AI_CACHE_TTL_MS = 5 * 60_000;   // cache quyết định AI 5 phút
+const AI_HISTORY_LIMIT = Math.min(
+  Math.max(Number(process.env.AI_HISTORY_LIMIT) || 300, 10),
+  1000
+);
+const AI_CACHE_MAX_ENTRIES = 50;
+const AI_CACHE_TTL_MS = 5 * 60 * 1000;
 
 // ==================== STATE ====================
-
-let cache = { updatedAt: 0, history: [], raw: null, error: null, promise: null };
-const aiCache = new Map(); // session -> { prediction, confidence, reason, raw, at }
+let sourceCache = {
+  updatedAt: 0,
+  history: [],
+  raw: null,
+  error: null,
+  promise: null
+};
+const aiCache = new Map(); // session -> { prediction, confidence, ... , at }
+let lastGeminiError = null;
 
 // =====================================================================
-//                      PHẦN 1: PARSE DỮ LIỆU NGUỒN
+//                      PHẦN 1: PARSE DỮ LIỆU NGUỒN (giữ nguyên)
 // =====================================================================
 
 function asNumber(value) {
@@ -67,7 +89,9 @@ function cleanKey(key) {
 
 function getByAliases(obj, aliases) {
   if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return undefined;
-  const lookup = new Map(Object.entries(obj).map(([k, v]) => [cleanKey(k), v]));
+  const lookup = new Map(
+    Object.entries(obj).map(([k, v]) => [cleanKey(k), v])
+  );
   for (const alias of aliases) {
     const v = lookup.get(cleanKey(alias));
     if (v !== undefined && v !== null) return v;
@@ -83,8 +107,13 @@ function parseDiceValue(value) {
     }
   }
   if (value && typeof value === 'object') {
-    const possible = Object.values(value).map(asNumber).filter((n) => n !== null);
-    if (possible.length >= 3 && possible.slice(0, 3).every((n) => n >= 1 && n <= 6)) {
+    const possible = Object.values(value)
+      .map(asNumber)
+      .filter((n) => n !== null);
+    if (
+      possible.length >= 3 &&
+      possible.slice(0, 3).every((n) => n >= 1 && n <= 6)
+    ) {
       return possible.slice(0, 3).map(Number);
     }
   }
@@ -95,7 +124,14 @@ function parseDiceValue(value) {
 }
 
 function extractDice(obj) {
-  const direct = getByAliases(obj, ['dice', 'xucxac', 'xuc xac', 'xuc_xac', 'ketqua', 'result']);
+  const direct = getByAliases(obj, [
+    'dice',
+    'xucxac',
+    'xuc xac',
+    'xuc_xac',
+    'ketqua',
+    'result'
+  ]);
   const parsedDirect = parseDiceValue(direct);
   if (parsedDirect) return parsedDirect;
 
@@ -115,14 +151,28 @@ function extractDice(obj) {
 function extractSession(obj) {
   return asSession(
     getByAliases(obj, [
-      'phien', 'phienid', 'phienhientai', 'session', 'sessionid',
-      'round', 'roundid', 'issue', 'period', 'gameid'
+      'phien',
+      'phienid',
+      'phienhientai',
+      'session',
+      'sessionid',
+      'round',
+      'roundid',
+      'issue',
+      'period',
+      'gameid'
     ])
   );
 }
 
 function extractResult(obj, dice) {
-  const direct = getByAliases(obj, ['ketqua', 'result', 'outcome', 'type', 'taixiu']);
+  const direct = getByAliases(obj, [
+    'ketqua',
+    'result',
+    'outcome',
+    'type',
+    'taixiu'
+  ]);
   if (typeof direct === 'string') {
     const t = direct.toLowerCase().trim();
     if (t.includes('tai') && !t.includes('xiu')) return 'Tài';
@@ -194,7 +244,7 @@ async function fetchSource() {
         accept: 'application/json',
         'cache-control': 'no-cache',
         pragma: 'no-cache',
-        'user-agent': 'DENIUS-API-SUNVIP/2.0-AI'
+        'user-agent': 'DENIUS-API-SUNVIP-AI/3.0'
       },
       signal: controller.signal
     });
@@ -205,40 +255,56 @@ async function fetchSource() {
   }
 }
 
-async function refresh(force = false) {
-  const fresh = Date.now() - cache.updatedAt < CACHE_MS && cache.history.length > 0;
-  if (!force && fresh) return cache.history;
-  if (cache.promise) return cache.promise;
+async function refreshSource(force = false) {
+  const fresh =
+    Date.now() - sourceCache.updatedAt < SOURCE_CACHE_MS &&
+    sourceCache.history.length > 0;
+  if (!force && fresh) return sourceCache.history;
+  if (sourceCache.promise) return sourceCache.promise;
 
-  cache.promise = (async () => {
+  sourceCache.promise = (async () => {
     try {
       const raw = await fetchSource();
       const history = normalizeHistory(raw);
-      if (!history.length) throw new Error('SOURCE_HISTORY_EMPTY_OR_UNRECOGNIZED');
-      cache = { updatedAt: Date.now(), history, raw, error: null, promise: null };
+      if (!history.length)
+        throw new Error('SOURCE_HISTORY_EMPTY_OR_UNRECOGNIZED');
+      sourceCache = {
+        updatedAt: Date.now(),
+        history,
+        raw,
+        error: null,
+        promise: null
+      };
       return history;
     } catch (error) {
-      cache = { ...cache, error: error?.message || String(error), promise: null };
-      if (cache.history.length) return cache.history;
+      sourceCache = {
+        ...sourceCache,
+        error: error?.message || String(error),
+        promise: null
+      };
+      if (sourceCache.history.length) return sourceCache.history;
       throw error;
     }
   })();
 
-  return cache.promise;
+  return sourceCache.promise;
 }
 
 // =====================================================================
-//                      PHẦN 3: AI ANALYSIS
+//                      PHẦN 3: AI ANALYSIS (Gemini)
 // =====================================================================
 
 function buildPrompt(history, targetSession) {
-  const window = history.slice(-AI_HISTORY_WINDOW);
-
-  // Chuỗi kết quả gọn (T/X) để AI "cảm" nhịp nhanh
-  const compact = window.map((x) => (x.result === 'Tài' ? 'T' : 'X')).join('');
+  const window = history.slice(-AI_HISTORY_LIMIT);
+  const compact = window
+    .map((x) => (x.result === 'Tài' ? 'T' : 'X'))
+    .join('');
 
   const detail = window
-    .map((x) => `#${x.session} ${x.dice.join('-')} (${x.total}) ${x.result}`)
+    .map(
+      (x) =>
+        `#${x.session} ${x.dice.join('-')} (${x.total}) ${x.result}`
+    )
     .join('\n');
 
   return `Bạn là "DENIUS" — một siêu trí tuệ nhân tạo chuyên phân tích Tài/Xỉu, nhưng mang trực giác và cảm xúc của một con người lão luyện. Bạn biết nghi ngờ khi cầu quá đẹp, biết sợ khi chuỗi bệt quá dài, biết liều khi tín hiệu đủ mạnh. Bạn KHÔNG bám vào công thức cứng — bạn cảm nhận nhịp cầu, đọc vị thuật toán nhà cái, và đưa ra phán đoán như một bậc thầy.
@@ -261,72 +327,137 @@ Yêu cầu phân tích:
 
 Sau khi phân tích, CHỐT DUY NHẤT 1 quyết định.
 
-=== ĐỊNH DẠNG TRẢ LỜI (BẮT BUỘC) ===
-DU_DOAN: Tài
-DO_TIN_CAY: 78%
-LY_DO: <1-2 câu ngắn gọn, có cảm xúc, thể hiện sự phân tích và trực giác>
-
-Không được thêm bất kỳ dòng nào khác ngoài 3 dòng trên.`;
+=== ĐỊNH DẠNG TRẢ LỜI (JSON) ===
+{
+  "prediction": "Tài" | "Xỉu",
+  "confidence": number (50-95),
+  "stance": "string (ví dụ: NGHIÊNG, CHẮC CHẮN, NGHI NGỜ)",
+  "signal": "string (tín hiệu chính)",
+  "analysis": "string (phân tích chi tiết)",
+  "doubt": "string (điều bạn nghi ngờ)",
+  "patterns": ["string", "string", ...]
+}`;
 }
 
-function parseAIResponse(text) {
-  const clean = String(text || '').trim();
+/**
+ * Schema JSON cho structured output.
+ * prediction chỉ được là "Tài" hoặc "Xỉu".
+ */
+const AI_RESPONSE_SCHEMA = {
+  type: 'object',
+  properties: {
+    prediction: {
+      type: 'string',
+      enum: ['Tài', 'Xỉu'],
+      description: 'Dự đoán cuối cùng: Tài hoặc Xỉu'
+    },
+    confidence: {
+      type: 'integer',
+      minimum: 50,
+      maximum: 95,
+      description: 'Độ tin cậy từ 50 đến 95'
+    },
+    stance: {
+      type: 'string',
+      description: 'Thái độ: NGHIÊNG, CHẮC CHẮN, NGHI NGỜ, ...'
+    },
+    signal: {
+      type: 'string',
+      description: 'Tín hiệu chính dẫn đến dự đoán'
+    },
+    analysis: {
+      type: 'string',
+      description: 'Phân tích chi tiết nhịp cầu, pattern, xu hướng'
+    },
+    doubt: {
+      type: 'string',
+      description: 'Điều AI nghi ngờ hoặc phản chứng với kết luận'
+    },
+    patterns: {
+      type: 'array',
+      items: { type: 'string' },
+      description: 'Các pattern phát hiện được'
+    }
+  },
+  required: [
+    'prediction',
+    'confidence',
+    'stance',
+    'signal',
+    'analysis',
+    'doubt',
+    'patterns'
+  ]
+};
 
-  const predMatch = clean.match(/DU_DOAN\s*[:：]\s*(Tài|Xỉu|Tai|Xiu)/i);
-  const confMatch = clean.match(/DO_TIN_CAY\s*[:：]\s*(\d{1,3})/i);
-  const reasonMatch = clean.match(/LY_DO\s*[:：]\s*([\s\S]+)/i);
+function validateAIResult(data) {
+  if (!data || typeof data !== 'object') return null;
+  if (data.prediction !== 'Tài' && data.prediction !== 'Xỉu') return null;
 
-  let prediction = null;
-  if (predMatch) {
-    const v = predMatch[1].toLowerCase();
-    prediction = v.startsWith('x') ? 'Xỉu' : 'Tài';
-  }
-
-  let confidence = confMatch ? Number(confMatch[1]) : 65;
-  confidence = Math.max(50, Math.min(95, confidence));
+  const confidence = Number(data.confidence);
+  if (!Number.isFinite(confidence)) return null;
 
   return {
-    prediction: prediction || 'Tài',
-    confidence,
-    reason: reasonMatch ? reasonMatch[1].trim() : '',
-    raw: clean
+    prediction: data.prediction,
+    confidence: Math.max(50, Math.min(95, Math.round(confidence))),
+    stance: String(data.stance || 'NGHIÊNG'),
+    signal: String(data.signal || ''),
+    analysis: String(data.analysis || ''),
+    doubt: String(data.doubt || ''),
+    patterns: Array.isArray(data.patterns)
+      ? data.patterns.map(String)
+      : []
   };
 }
 
-async function callAIGemini(prompt) {
+async function callGeminiAPI(prompt) {
+  const body = {
+    contents: [
+      {
+        role: 'user',
+        parts: [{ text: prompt }]
+      }
+    ],
+    generationConfig: {
+      temperature: 1.0,
+      topP: 0.95,
+      topK: 40,
+      maxOutputTokens: 8192,
+      responseMimeType: 'application/json',
+      responseSchema: AI_RESPONSE_SCHEMA,
+      thinkingConfig: {
+        thinkingLevel: 'high'
+      }
+    },
+    safetySettings: [
+      {
+        category: 'HARM_CATEGORY_HARASSMENT',
+        threshold: 'BLOCK_NONE'
+      },
+      {
+        category: 'HARM_CATEGORY_HATE_SPEECH',
+        threshold: 'BLOCK_NONE'
+      },
+      {
+        category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT',
+        threshold: 'BLOCK_NONE'
+      },
+      {
+        category: 'HARM_CATEGORY_DANGEROUS_CONTENT',
+        threshold: 'BLOCK_NONE'
+      }
+    ]
+  };
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), AI_TIMEOUT_MS);
 
   try {
-    const body = {
-      contents: [
-        {
-          role: 'user',
-          parts: [{ text: prompt }]
-        }
-      ],
-      generationConfig: {
-        temperature: 1.0,
-        topP: 0.95,
-        topK: 40,
-        maxOutputTokens: 2048
-      },
-      safetySettings: [
-        { category: 'HARM_CATEGORY_HARASSMENT', threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_HATE_SPEECH', threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_SEXUALLY_EXPLICIT', threshold: 'BLOCK_NONE' },
-        { category: 'HARM_CATEGORY_DANGEROUS_CONTENT', threshold: 'BLOCK_NONE' }
-      ]
-    };
-
-    // Gửi key cả 2 kiểu: query + Bearer (để key dạng AQ.* chạy được)
-    const url = `${GEMINI_URL}?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-
-    const res = await fetch(url, {
+    const res = await fetch(GEMINI_URL, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'authorization': `Bearer ${GEMINI_API_KEY}`,
+        // ✅ ĐÚNG: Gemini API dùng header x-goog-api-key
         'x-goog-api-key': GEMINI_API_KEY
       },
       body: JSON.stringify(body),
@@ -335,108 +466,160 @@ async function callAIGemini(prompt) {
 
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
-      throw new Error(`AI_HTTP_${res.status}: ${errBody.slice(0, 300)}`);
+      const err = new Error(`AI_HTTP_${res.status}: ${errBody.slice(0, 300)}`);
+      err.status = res.status;
+      throw err;
     }
 
     const data = await res.json();
 
-    // Chuẩn REST v1beta
+    // Structured output: responseMimeType=application/json => text là JSON string
     let text =
       data?.candidates?.[0]?.content?.parts
         ?.map((p) => p.text)
         .filter(Boolean)
         .join('') || '';
 
-    // Fallback nếu API dạng "interactions" preview
-    if (!text && Array.isArray(data?.steps)) {
-      text = data.steps
-        .flatMap((s) => s?.content || [])
-        .map((c) => c?.text)
-        .filter(Boolean)
-        .join('');
+    if (!text) {
+      throw new Error('AI_EMPTY_RESPONSE');
     }
 
-    if (!text) throw new Error('AI_EMPTY_RESPONSE: ' + JSON.stringify(data).slice(0, 300));
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error('AI_INVALID_JSON: ' + text.slice(0, 200));
+    }
 
-    return parseAIResponse(text);
+    const validated = validateAIResult(parsed);
+    if (!validated) {
+      throw new Error('AI_SCHEMA_MISMATCH');
+    }
+
+    return validated;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function callAI(history, targetSession) {
-  const prompt = buildPrompt(history, targetSession);
+function shouldRetry(error) {
+  const status = error?.status;
+  if (status === 401 || status === 403) return false; // auth error - không retry
+  if (status === 429) return true;
+  if (status >= 500) return true;
+  if (error?.name === 'AbortError') return true;
+  return false;
+}
 
+async function callAIWithRetry(prompt) {
   let lastError;
-  for (let attempt = 0; attempt <= AI_RETRY; attempt++) {
+  for (let attempt = 0; attempt <= AI_MAX_RETRIES; attempt++) {
     try {
-      return await callAIGemini(prompt);
+      const result = await callGeminiAPI(prompt);
+      lastGeminiError = null;
+      return result;
     } catch (err) {
       lastError = err;
-      // backoff nhẹ
-      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+      if (!shouldRetry(err) || attempt === AI_MAX_RETRIES) break;
+      const delay = AI_RETRY_DELAY_MS * Math.pow(2, attempt);
+      await new Promise((r) => setTimeout(r, delay));
     }
   }
+  lastGeminiError = lastError?.message || String(lastError);
   throw lastError;
 }
 
-async function getAIPrediction(history, session) {
-  const cached = aiCache.get(session);
-  if (cached && Date.now() - cached.at < AI_CACHE_TTL_MS) return cached;
-
-  const result = await callAI(history, session);
-  aiCache.set(session, { ...result, at: Date.now() });
-
-  // Giới hạn cache
-  if (aiCache.size > 300) {
-    const firstKey = aiCache.keys().next().value;
-    aiCache.delete(firstKey);
+async function getAIPrediction(history, targetSession) {
+  const cached = aiCache.get(targetSession);
+  if (cached && Date.now() - cached.at < AI_CACHE_TTL_MS) {
+    return cached;
   }
-  return result;
+
+  const prompt = buildPrompt(history, targetSession);
+  const result = await callAIWithRetry(prompt);
+
+  const entry = {
+    ...result,
+    targetSession,
+    at: Date.now()
+  };
+
+  aiCache.set(targetSession, entry);
+
+  // Giới hạn cache: giữ 20-50 entry mới nhất
+  if (aiCache.size > AI_CACHE_MAX_ENTRIES) {
+    const keys = Array.from(aiCache.keys());
+    const removeCount = aiCache.size - AI_CACHE_MAX_ENTRIES;
+    for (let i = 0; i < removeCount; i++) {
+      aiCache.delete(keys[i]);
+    }
+  }
+
+  return entry;
 }
 
 // =====================================================================
 //                      PHẦN 4: BUILD RESPONSE
 // =====================================================================
 
-async function buildResponse(history) {
+async function buildTxResponse(history) {
   const latest = history[history.length - 1];
   const out = [];
 
-  // Đối chiếu dự đoán phiên mới nhất (dùng context TRƯỚC nó)
+  // Đối chiếu dự đoán phiên mới nhất (nếu có context trước đó)
   if (history.length >= 2) {
     const ctxBefore = history.slice(0, -1);
     try {
       const oldDecision = await getAIPrediction(ctxBefore, latest.session);
+      const actual = latest.result;
+      const correct = oldDecision.prediction === actual;
+
       out.push({
         Phien: latest.session,
         Du_doan: oldDecision.prediction,
         Do_tin_cay: oldDecision.confidence + '%',
-        Ly_do: oldDecision.reason,
-        KetQua: oldDecision.prediction === latest.result ? '✅ ĐÚNG' : '❌ SAI',
-        Thuc_te: latest.result,
+        AI: 'GEMINI',
+        TrangThai: oldDecision.stance,
+        TinHieu: oldDecision.signal,
+        PhanTich: oldDecision.analysis,
+        NghiNgo: oldDecision.doubt,
+        Patterns: oldDecision.patterns,
+        Model: GEMINI_MODEL,
+        SoPhienDaPhanTich: Math.min(history.length - 1, AI_HISTORY_LIMIT),
+        KetQua: correct ? '✅ ĐÚNG' : '❌ SAI',
+        Thuc_te: actual,
         ADMIN
       });
     } catch (e) {
-      out.push({
-        Phien: latest.session,
-        Du_doan: 'N/A',
-        Do_tin_cay: '0%',
-        Ly_do: 'AI_ERR: ' + e.message,
-        ADMIN
-      });
+      // Không chặn response chính nếu audit lỗi
     }
   }
 
   // Phiên kế tiếp = phiên mới nhất + 1
   const currentSession = latest.session + 1;
-  const decision = await getAIPrediction(history, currentSession);
+  let decision;
+  try {
+    decision = await getAIPrediction(history, currentSession);
+  } catch (e) {
+    return {
+      success: false,
+      error: e.message,
+      ADMIN
+    };
+  }
 
   out.push({
     Phien: currentSession,
     Du_doan: decision.prediction,
     Do_tin_cay: decision.confidence + '%',
-    Ly_do: decision.reason,
+    AI: 'GEMINI',
+    TrangThai: decision.stance,
+    TinHieu: decision.signal,
+    PhanTich: decision.analysis,
+    NghiNgo: decision.doubt,
+    Patterns: decision.patterns,
+    Model: GEMINI_MODEL,
+    SoPhienDaPhanTich: Math.min(history.length, AI_HISTORY_LIMIT),
     ADMIN
   });
 
@@ -447,46 +630,99 @@ async function buildResponse(history) {
 //                      PHẦN 5: ROUTES
 // =====================================================================
 
-async function handlePredict(req, res) {
+async function handleTx(req, res) {
+  if (!GEMINI_API_KEY) {
+    return res.status(503).json({
+      success: false,
+      error: 'GEMINI_API_KEY_MISSING',
+      ADMIN
+    });
+  }
+
   try {
-    const history = await refresh(req.query.refresh === '1');
-    const result = await buildResponse(history);
+    const history = await refreshSource(req.query.refresh === '1');
+    const result = await buildTxResponse(history);
+
+    if (result.success === false) {
+      return res.status(503).json(result);
+    }
+
     res.json(result);
   } catch (error) {
-    res.status(503).json({ success: false, error: error.message, ADMIN });
+    res.status(503).json({
+      success: false,
+      error: error.message,
+      ADMIN
+    });
   }
 }
 
-app.get('/', handlePredict);
-app.get('/api', handlePredict);
-app.get('/api/tx', handlePredict);
+app.get('/', handleTx);
+app.get('/api', handleTx);
+app.get('/api/tx', handleTx);
 
 app.get('/api/history', async (req, res) => {
   try {
-    const history = await refresh(req.query.refresh === '1');
-    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 20));
+    const history = await refreshSource(req.query.refresh === '1');
+    const limit = Math.min(
+      100,
+      Math.max(1, Number(req.query.limit) || 20)
+    );
     res.json(
-      history.slice(-limit).reverse().map((x) => ({
-        Phien: x.session,
-        Xuc_xac: x.dice,
-        Tong: x.total,
-        Ket_qua: x.result
-      }))
+      history
+        .slice(-limit)
+        .reverse()
+        .map((x) => ({
+          Phien: x.session,
+          Xuc_xac: x.dice,
+          Tong: x.total,
+          Ket_qua: x.result
+        }))
     );
   } catch (error) {
-    res.status(503).json({ success: false, error: error.message, ADMIN });
+    res.status(503).json({
+      success: false,
+      error: error.message,
+      ADMIN
+    });
   }
 });
 
-// Test AI thô (debug)
-app.get('/api/ai-test', async (req, res) => {
+app.get('/api/ai/latest', async (req, res) => {
+  if (!GEMINI_API_KEY) {
+    return res.status(503).json({
+      success: false,
+      error: 'GEMINI_API_KEY_MISSING',
+      ADMIN
+    });
+  }
+
   try {
-    const history = await refresh();
+    const history = await refreshSource(req.query.refresh === '1');
     const latest = history[history.length - 1];
-    const decision = await callAI(history, latest.session + 1);
-    res.json(decision);
+    const targetSession = latest.session + 1;
+    const decision = await getAIPrediction(history, targetSession);
+
+    res.json({
+      Phien: targetSession,
+      Du_doan: decision.prediction,
+      Do_tin_cay: decision.confidence + '%',
+      AI: 'GEMINI',
+      TrangThai: decision.stance,
+      TinHieu: decision.signal,
+      PhanTich: decision.analysis,
+      NghiNgo: decision.doubt,
+      Patterns: decision.patterns,
+      Model: GEMINI_MODEL,
+      SoPhienDaPhanTich: Math.min(history.length, AI_HISTORY_LIMIT),
+      ADMIN
+    });
   } catch (error) {
-    res.status(503).json({ success: false, error: error.message, ADMIN });
+    res.status(503).json({
+      success: false,
+      error: error.message,
+      ADMIN
+    });
   }
 });
 
@@ -495,17 +731,29 @@ app.get('/health', (req, res) => {
     ok: true,
     service: 'DENIUS-API-SUNVIP-AI',
     source: SOURCE_API,
-    aiModel: GEMINI_MODEL,
-    cached: cache.history.length,
-    aiCached: aiCache.size,
-    lastUpdate: cache.updatedAt ? new Date(cache.updatedAt).toISOString() : null,
-    sourceError: cache.error,
+    cached: sourceCache.history.length,
+    sourceError: sourceCache.error,
+    lastUpdate: sourceCache.updatedAt
+      ? new Date(sourceCache.updatedAt).toISOString()
+      : null,
+    gemini: {
+      configured: Boolean(GEMINI_API_KEY),
+      model: GEMINI_MODEL,
+      thinkingLevel: 'high',
+      cachedPredictions: aiCache.size,
+      historyLimit: AI_HISTORY_LIMIT,
+      lastError: lastGeminiError
+    },
     uptime: Math.floor(process.uptime())
   });
 });
 
 app.use((req, res) =>
-  res.status(404).json({ success: false, error: 'Endpoint not found', ADMIN })
+  res.status(404).json({
+    success: false,
+    error: 'Endpoint not found',
+    ADMIN
+  })
 );
 
 // =====================================================================
@@ -514,9 +762,21 @@ app.use((req, res) =>
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[DENIUS-API-SUNVIP-AI] listening on ${PORT}`);
-  refresh().catch((err) => console.error('[SOURCE]', err.message));
+  console.log(`[GEMINI] model=${GEMINI_MODEL} thinking=high historyLimit=${AI_HISTORY_LIMIT}`);
+
+  if (!GEMINI_API_KEY) {
+    console.warn('[GEMINI] GEMINI_API_KEY is not set. AI endpoints will return 503.');
+  }
+
+  refreshSource().catch((err) =>
+    console.error('[SOURCE]', err.message)
+  );
+
   setInterval(
-    () => refresh(true).catch((err) => console.error('[SOURCE]', err.message)),
+    () =>
+      refreshSource(true).catch((err) =>
+        console.error('[SOURCE]', err.message)
+      ),
     1500
   ).unref();
 });
