@@ -1,0 +1,15 @@
+{
+  "name": "denius-api-sunvip",
+  "version": "2.0.0",
+  "description": "DENIUS Sunwin Tài/Xỉu API - AI Powered",
+  "main": "ttoanvip.js",
+  "scripts": {
+    "start": "node ttoanvip.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
